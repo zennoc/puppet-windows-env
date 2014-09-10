@@ -14,10 +14,27 @@ Install from git (do this in your modulepath):
 
     git clone https://github.com/badgerious/puppet-windows-env windows_env
 
+This module also requires the 'ffi' gem. This gem is included
+with Puppet 3.3.0+. On older versions, you'll need to do something like:
+
+```puppet
+
+package { 'ffi':
+  ensure   => installed,
+  provider => gem,
+}
+
+```
+
 Changes
 -------
 
-Please see [CHANGELOG.md](https://github.com/badgerious/puppet-windows-env/blob/master/CHANGELOG.md)
+[CHANGELOG.md](https://github.com/badgerious/puppet-windows-env/blob/master/CHANGELOG.md)
+
+Compatibility
+-------------
+
+Puppet 3.7 or greater requires version 2.2.0 or greater of this module.
 
 Usage
 -----
@@ -57,34 +74,32 @@ Valid values:
   - When `ensure => present`, creates a new variable (if necessary) and sets
     its value. If the variable already exists, its value will be overwritten.
   - When `ensure => absent`, the environment variable will be deleted entirely. 
-- `prepend`
+- `insert`
   - When `ensure => present`, creates a new variable (if necessary) and sets
     its value. If the variable already exists, the puppet resource provided
-    content will be merged with the existing content. The puppet provided
-    content will be placed at the beginning, and separated from existing
-    entries with `separator`. If the specified value is already in the
-    variable, but not at the beginning, it will be moved to the beginning. In
-    the case of multiple resources in `prepend` mode managing the same
-    variable, the values will inserted in the order of evaluation (the last to
-    run will be listed first in the variable).  Note that with multiple
-    `prepend`s on the same resource, there will be shuffling around on every
-    puppet run, since each resource will place its own value at the front of
-    the list when it is run. Alternatively, an array can be provided to
-    `value`.  The relative ordering of the array items will be maintained when
-    they are inserted into the variable, and the shuffling will be avoided.
+    content will be merged with the existing content. The puppet provided content
+    will be placed at the end, and separated from existing entries with
+    `separator`. If the specified value is already somewhere in the variable, no
+    change will occur.
   - When `ensure => absent`, the value provided by the puppet resource will be
     removed from the environment variable. Other content will be left
     unchanged. The environment variable will not be removed, even if its
     contents are blank. 
+- `prepend`
+  - Same as `insert`, except Puppet will ensure the value appears **first**. If
+    the specified value is already in the variable, but not at the beginning, it
+    will be moved to the beginning. In the case of multiple resources in
+    `prepend` mode managing the same variable, the values will be inserted in the
+    order of evaluation (the last to run will be listed first in the variable).
+    Note that with multiple `prepend`s on the same resource, there will be
+    shuffling around on every puppet run, since each resource will place its own
+    value at the front of the list when it is run. Alternatively, an array can be
+    provided to `value`.  The relative ordering of the array items will be
+    maintained when they are inserted into the variable, and the shuffling will
+    be avoided.
 - `append`
-  - Same as `prepend`, except the new value will be placed at the end of the
+  - Same as `prepend`, except the new value will be placed at (or be moved to) the end of the
     variable's existing contents rather than the beginning. 
-- `insert`
-  - Same as `prepend` or `append`, except that content is not required to be
-    anywhere in particular. New content will be added at the end, but existing
-    content will not be moved. This is probably the mode to use unless there
-    are some conflicts that need to be resolved (the conflicts may be better
-    resolved with an array given to `value` and with `mergemode => insert`). 
 
 #### `type`
 The type of registry value to use. Default is `undef` for existing keys (i.e.
@@ -96,8 +111,8 @@ Valid values:
   - This is a regular registry string item with no substitution. 
 - `REG_EXPAND_SZ`
   - Values of this type will expand '%' enclosed strings (e.g. `%SystemRoot%`)
-    derived from other environment variables. If you're on a 64-bit system, be
-    careful here; puppet runs as a 32-bit ruby process, and may be subject to
+    derived from other environment variables. If you're on a 64-bit system and
+    running 32-bit puppet, be careful here; registry writes may be subject to
     WoW64 registry redirection shenanigans. This module writes keys with the
     KEY_WOW64_64KEY flag, which on Windows 7+ (Server 2008 R2) systems will
     disable value rewriting. Older systems will rewrite certain values. The
@@ -171,25 +186,17 @@ or refresh their environment by some other means.
       broadcast_timeout => 2000,
     }
 
+    # Exec doStuff.bat whenever environment variable KOOLVAR changes.
+    # Note that if you have multiple windows_env resources managing one
+    # variable, you'll need to either subscribe to all of them or combine
+    # the windows_env resources into one (by passing an array to 'value')
+    # and subscribing to that one resource.
+    exec { 'C:\doStuff.bat':
+      subscribe   => Windows_env['KOOLVAR'],
+      refreshonly => true,
+    }
+
 ```
-
-### Things that won't end well
-Certain conflicts can occur which may cause unexpected behavior (which you may not be warned about):
-
-- Multiple resource declarations controlling the same environment variable with
-  at least one in `mergemode => clobber`. Toes will be stepped on. 
-- Multiple resource declarations controlling the same environment variable with
-  different `type`s. More squished toes. 
-
-If you find yourself using `mergemode => clobber` or `type`, I recommend using
-the environment variable name as the resource title (like the example 'Title
-type #2' above) if you can; this way puppet will flag duplicates for you and
-help identify the conflicts. 
-
-
-Compatibility
--------------
-This module has been tested against a 3.2.x puppetmaster, 2.7.x and 3.2.x agents. 
 
 Acknowledgements
 ----------------

@@ -1,10 +1,33 @@
 Puppet::Type.newtype(:windows_env) do
   desc "Manages Windows environment variables"
 
-  ensurable do
-    newvalue(:present) { provider.create }
-    newvalue(:absent) { provider.destroy }
-    defaultto(:present)
+  # Track resources that are managing the same environment variable so we can
+  # detect mergemode/type conflicts
+  @mergemode = {}
+  @type = {}
+  def self.check_collisions(resource)
+    user = resource[:user] || :SYSTEM
+    var = resource[:variable].downcase
+
+    # Cannot have two resources in clobber mode on the same var
+    @mergemode[user] ||= {}
+    last = @mergemode[user][var]
+    if (resource[:mergemode] == :clobber && last) || (last && last[:mergemode] == :clobber)
+      fail "Multiple resources are managing the same environment variable but at least one is in clobber mergemode. (Offending resources: #{resource}, #{last})"
+    else
+      @mergemode[user][var] = resource
+    end
+
+    # Cannot have two resources with different types on the same var
+    if ![nil, :undef].include?(resource[:type])
+      @type[user] ||= {}
+      last = @type[user][var]
+      if last && last[:type] != resource[:type]
+        fail "Multiple resources are managing the same environment variable but their types do not agree (Offending resources: #{resource}, #{last})"
+      else
+        @type[user][var] = resource
+      end
+    end
   end
 
   # title will look like "#{variable}=#{value}" (The '=' is not permitted in 
@@ -16,6 +39,12 @@ Puppet::Type.newtype(:windows_env) do
      [/^([^=]+)$/   , [[:variable, proc{|x| x}]]]]
   end
 
+  ensurable do
+    newvalue(:present) { provider.create }
+    newvalue(:absent) { provider.destroy }
+    defaultto(:present)
+  end
+
   newparam(:variable) do
     desc "The environment variable name"
     isnamevar
@@ -24,6 +53,14 @@ Puppet::Type.newtype(:windows_env) do
   newparam(:value) do
     desc "The environment variable value"
     isnamevar
+
+    munge do |val|
+      if val.class != Array
+        [val]
+      else
+        val
+      end
+    end
   end
 
   newparam(:user) do
@@ -59,5 +96,17 @@ Puppet::Type.newtype(:windows_env) do
   newproperty(:type) do
     desc "What type of registry key to use for the variable. Determines whether interpolation of '%' enclosed names will occur"
     newvalues(:REG_SZ, :REG_EXPAND_SZ)
+  end
+
+  validate do
+    if self[:ensure] == :present && [nil, :undef].include?(self[:value])
+      fail "'value' parameter must be provided when 'ensure => present'"
+    end
+    if self[:ensure] == :absent && [nil, :undef].include?(self[:value]) &&
+      [:prepend, :append, :insert].include?(self[:mergemode])
+      fail "'value' parameter must be provided when 'ensure => absent' and 'mergemode => #{self[:mergemode]}'"
+    end
+
+    self.class.check_collisions(self)
   end
 end

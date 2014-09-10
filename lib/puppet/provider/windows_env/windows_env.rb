@@ -2,10 +2,9 @@
 # if some of them are present, the others should be too. This check prevents errors from 
 # non Windows nodes that have had this module pluginsynced to them. 
 if Puppet.features.microsoft_windows?
-  require 'Win32API'  
+  require 'puppet/util/windows/error'
   require 'puppet/util/windows/security'
   require 'win32/registry' 
-  require 'windows/error'
   module Win32
     class Registry
       KEY_WOW64_64KEY = 0x0100 unless defined?(KEY_WOW64_64KEY)
@@ -13,16 +12,25 @@ if Puppet.features.microsoft_windows?
   end
 end
 
-# This is apparently the "best" way to do unconditional cleanup for a provider.
-# see https://groups.google.com/forum/#!topic/puppet-dev/Iqs5jEGfu_0
-module Puppet
-  class Transaction
-    # added '_xhg62j' to make sure that if somebody else does this monkey patch, they don't
-    # choose the same name as I do, since that would cause ruby to blow up. 
-    alias_method :evaluate_original_xhg62j, :evaluate
-    def evaluate
-      evaluate_original_xhg62j
-      Puppet::Type::Windows_env::ProviderWindows_env.unload_user_hives
+require 'puppet/feature/windows_env'
+
+if Puppet.version < '3.4.0'
+  # This is the best pre-3.4.0 way to do unconditional cleanup for a provider.
+  # see https://groups.google.com/forum/#!topic/puppet-dev/Iqs5jEGfu_0
+  module Puppet
+    class Transaction
+      # The alias name (evaluate_orig_windows_env) should be unique to make
+      # sure that if somebody else does this monkey patch, they don't choose
+      # the same name and cause ruby to blow up.
+      alias_method :evaluate_orig_windows_env, :evaluate
+      def evaluate
+        evaluate_orig_windows_env
+        begin
+          Puppet::Type::Windows_env::ProviderWindows_env.post_resource_eval
+        rescue => detail
+          Puppet.log_exception(detail, "post_resource_eval failed for provider windows_env")
+        end
+      end
     end
   end
 end
@@ -30,16 +38,27 @@ end
 Puppet::Type.type(:windows_env).provide(:windows_env) do
   desc "Manage Windows environment variables"
 
+  confine :feature => :windows_env
   confine :osfamily => :windows
   defaultfor :osfamily => :windows
 
-  # This feature check is necessary to make 'puppet module build' work, since
-  # it actually executes this code in building.
-  if Puppet.features.microsoft_windows?
-    self::SendMessageTimeout = Win32API.new('user32', 'SendMessageTimeout', 'LLLPLLP', 'L')
-    self::RegLoadKey = Win32API.new('Advapi32', 'RegLoadKey', 'LPP', 'L')
-    self::RegUnLoadKey = Win32API.new('Advapi32', 'RegUnLoadKey', 'LP', 'L')
-    self::FormatMessage = Win32API.new('kernel32', 'FormatMessage', 'LLLLPL', 'L')
+  # The 'windows_env' feature includes FFI.  Here we need to be able to fully
+  # load the provider even if FFI is absent so that the catalog can continue
+  # (and hopefully install FFI).
+  if Puppet.features.windows_env?
+    module self::WinAPI
+      extend FFI::Library
+
+      ffi_convention :stdcall
+
+      ffi_lib :User32
+      attach_function :SendMessageTimeout, :SendMessageTimeoutA, [:uintptr_t, :uint, :pointer, :pointer, :uint, :uint, :pointer], :pointer
+
+      ffi_lib :Advapi32
+      attach_function :RegLoadKey, :RegLoadKeyA, [:uintptr_t, :pointer, :pointer], :long
+
+      attach_function :RegUnLoadKey, :RegUnLoadKeyA, [:uintptr_t, :pointer], :long
+    end
   end
 
   # Instances can load hives with #load_user_hive . The class takes care of
@@ -49,36 +68,31 @@ Puppet::Type.type(:windows_env).provide(:windows_env) do
     attr_reader :loaded_hives
   end
 
-  def self.unload_user_hives
+  def self.post_resource_eval
     Puppet::Util::Windows::Security.with_privilege(Puppet::Util::Windows::Security::SE_RESTORE_NAME) do
       @loaded_hives.each do |hash| 
         user_sid = hash[:user_sid]
         username = hash[:username]
         debug "Unloading NTUSER.DAT for '#{username}'"
-        result = self::RegUnLoadKey.call(Win32::Registry::HKEY_USERS.hkey, user_sid)
+        result = self::WinAPI.RegUnLoadKey(Win32::Registry::HKEY_USERS.hkey, user_sid)
       end
     end
   end
 
   def exists?
-    if @resource[:ensure] == :present && [nil, :nil].include?(@resource[:value])
-      self.fail "'value' parameter must be provided when 'ensure => present'"
-    end
-    if @resource[:ensure] == :absent && [nil, :nil].include?(@resource[:value]) && 
-      [:prepend, :append, :insert].include?(@resource[:mergemode])
-      self.fail "'value' parameter must be provided when 'ensure => absent' and 'mergemode => #{@resource[:mergemode]}'"
-    end
+    # For testing registry open result
+    _ERROR_FILE_NOT_FOUND = 2
 
     if @resource[:user]
       @reg_hive = Win32::Registry::HKEY_USERS
-      @user_sid = Puppet::Util::Windows::Security.name_to_sid(@resource[:user])
+      @user_sid = name_to_sid(@resource[:user])
       @user_sid or self.fail "Username '#{@resource[:user]}' could not be converted to a valid SID"
       @reg_path = "#{@user_sid}\\Environment"
 
       begin
         @reg_hive.open(@reg_path) {}
       rescue Win32::Registry::Error => error
-        if error.code == Windows::Error::ERROR_FILE_NOT_FOUND
+        if error.code == _ERROR_FILE_NOT_FOUND
           load_user_hive
         else
           reg_fail("Can't access Environment for user '#{@resource[:user]}'. Opening", error)
@@ -94,15 +108,11 @@ Puppet::Type.type(:windows_env).provide(:windows_env) do
     @reg_types = { :REG_SZ => Win32::Registry::REG_SZ, :REG_EXPAND_SZ => Win32::Registry::REG_EXPAND_SZ }
     @reg_type = @reg_types[@resource[:type]]
 
-    if @resource[:value].class != Array
-      @resource[:value] = [@resource[:value]]
-    end
-
     begin
       # key.read returns '[type, data]' and must be used instead of [] because [] expands %variables%. 
       @reg_hive.open(@reg_path) { |key| @value = key.read(@resource[:variable])[1] } 
     rescue Win32::Registry::Error => error
-      if error.code == Windows::Error::ERROR_FILE_NOT_FOUND
+      if error.code == _ERROR_FILE_NOT_FOUND
         debug "Environment variable #{@resource[:variable]} not found"
         return false
       end
@@ -203,6 +213,26 @@ Puppet::Type.type(:windows_env).provide(:windows_env) do
 
   private
 
+  # name_to_sid moved from 'security' to 'sid' in Puppet 3.7.
+  # 'puppet/util/windows/sid' is not guaranteed to exist on older 3.x Puppets.
+  use_util_windows_sid = false
+  begin
+    require 'puppet/util/windows/sid'
+    if Puppet::Util::Windows::SID.respond_to?(:name_to_sid)
+      use_util_windows_sid = true
+    end
+  rescue LoadError
+  end
+  if use_util_windows_sid
+    def name_to_sid(name)
+      Puppet::Util::Windows::SID.name_to_sid(name)
+    end
+  else
+    def name_to_sid(name)
+      Puppet::Util::Windows::Security.name_to_sid(name)
+    end
+  end
+
   def reg_fail(action, error)
     self.fail "#{action} '#{@reg_hive.name}:\\#{@reg_path}\\#{@resource[:variable]}' returned error #{error.code}: #{error.message}"
   end
@@ -236,8 +266,8 @@ Puppet::Type.type(:windows_env).provide(:windows_env) do
     debug "Broadcasting changes to environment"
     _HWND_BROADCAST = 0xFFFF
     _WM_SETTINGCHANGE = 0x1A
-    self.class::SendMessageTimeout.call(_HWND_BROADCAST, _WM_SETTINGCHANGE, 0, 'Environment', 2, @resource[:broadcast_timeout], 0)
-  end    
+    self.class::WinAPI.SendMessageTimeout(_HWND_BROADCAST, _WM_SETTINGCHANGE, nil, 'Environment', 2, @resource[:broadcast_timeout], nil)
+  end
 
   # This is the best solution I found to (at least mostly) reliably locate a user's 
   # ntuser.dat: http://stackoverflow.com/questions/1059460/shgetfolderpath-for-a-specific-user
@@ -256,12 +286,9 @@ Puppet::Type.type(:windows_env).provide(:windows_env) do
     ntuser_path = File.join(home_path, 'NTUSER.DAT')
 
     Puppet::Util::Windows::Security.with_privilege(Puppet::Util::Windows::Security::SE_RESTORE_NAME) do
-      result = self.class::RegLoadKey.call(Win32::Registry::HKEY_USERS.hkey, @user_sid, ntuser_path)
+      result = self.class::WinAPI.RegLoadKey(Win32::Registry::HKEY_USERS.hkey, @user_sid, ntuser_path)
       unless result == 0
-        _FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
-        message = ' ' * 512
-        self.class::FormatMessage.call(_FORMAT_MESSAGE_FROM_SYSTEM, 0, result, 0, message, message.length)
-        self.fail "Could not load registry hive for user '#{@resource[:user]}'. RegLoadKey returned #{result}: #{message.strip}"
+        raise Puppet::Util::Windows::Error.new("Could not load registry hive for user '#{@resource[:user]}'", result)
       end
     end
 
